@@ -2,38 +2,67 @@
   'use strict';
 
   // ============================================================
-  // ARCOS FILE UPLOAD EXTENSION
+  // ARCOS FILE UPLOAD EXTENSIONS
   // ============================================================
   //
-  // Two Voiceflow custom-response extensions:
+  // Browser-side only.
   //
-  // 1. ARCOS_FILE_SELECTION
-  //    - Lets the user choose a file.
-  //    - Stores the browser File object locally.
-  //    - Sends file metadata back to Voiceflow.
+  // Responsibilities:
+  //   1. Let the client select exactly one file.
+  //   2. Perform UX-level validation.
+  //   3. Return file metadata to Voiceflow.
+  //   4. Receive the backend-generated signed GCS PUT URL.
+  //   5. Upload the browser File directly to GCS.
+  //   6. Return upload completion/failure to Voiceflow.
   //
-  // 2. ARCOS_FILE_UPLOAD
-  //    - Receives the temporary GCS signed PUT URL.
-  //    - Uploads the selected File directly to GCS.
-  //    - Signals success/failure back to Voiceflow.
+  // SECURITY:
+  //   No ARCOS secrets, API keys, Airtable PATs, or verification
+  //   tokens are stored in this file.
   //
-  // No ARCOS secrets or API keys belong in this code.
+  // The backend remains authoritative for all security and upload
+  // validation. Client-side checks are for user experience only.
   // ============================================================
 
+  var ARCOS_EXTENSION_VERSION = '1.0.0';
 
   // ------------------------------------------------------------
-  // Local browser state
+  // Shared browser state
   // ------------------------------------------------------------
 
-  window.__ARCOS_SELECTED_FILE = null;
+  window.__ARCOS_UPLOAD_STATE = window.__ARCOS_UPLOAD_STATE || {
+    selectedFile: null,
+    selectionToken: 0,
+    activeUploadId: null
+  };
 
+  var state = window.__ARCOS_UPLOAD_STATE;
+
+  // ------------------------------------------------------------
+  // Constants
+  // ------------------------------------------------------------
+
+  var DOCUMENT_TYPES = ['JPG', 'JPEG', 'HEIC', 'PDF'];
+  var VIDEO_TYPES = ['MP4', 'MOV'];
+
+  var MAX_DOCUMENT_BYTES = 50 * 1024 * 1024;
+  var MAX_VIDEO_BYTES = 512 * 1024 * 1024;
+  var MAX_VIDEO_SECONDS = 180;
+
+  var CONTENT_TYPES = {
+    JPG: 'image/jpeg',
+    JPEG: 'image/jpeg',
+    HEIC: 'image/heic',
+    PDF: 'application/pdf',
+    MP4: 'video/mp4',
+    MOV: 'video/quicktime'
+  };
 
   // ------------------------------------------------------------
   // Helpers
   // ------------------------------------------------------------
 
   function getExtension(fileName) {
-    const parts = String(fileName || '').toLowerCase().split('.');
+    var parts = String(fileName || '').toLowerCase().split('.');
 
     if (parts.length < 2) {
       return '';
@@ -42,11 +71,10 @@
     return parts.pop();
   }
 
-
   function normalizeFileType(fileName) {
-    const extension = getExtension(fileName);
+    var extension = getExtension(fileName);
 
-    const types = {
+    var types = {
       jpg: 'JPG',
       jpeg: 'JPEG',
       heic: 'HEIC',
@@ -58,58 +86,29 @@
     return types[extension] || '';
   }
 
-
-  function getContentType(file, normalizedType) {
-    if (file && file.type) {
-      return file.type;
-    }
-
-    const fallbackTypes = {
-      JPG: 'image/jpeg',
-      JPEG: 'image/jpeg',
-      HEIC: 'image/heic',
-      PDF: 'application/pdf',
-      MP4: 'video/mp4',
-      MOV: 'video/quicktime'
-    };
-
-    return fallbackTypes[normalizedType] || 'application/octet-stream';
+  function getCanonicalContentType(normalizedType) {
+    return CONTENT_TYPES[normalizedType] || 'application/octet-stream';
   }
 
-
   function formatFileSize(bytes) {
+    if (!Number.isFinite(bytes)) {
+      return 'Unknown size';
+    }
+
     if (bytes < 1024) {
-      return `${bytes} B`;
+      return bytes + ' B';
     }
 
     if (bytes < 1024 * 1024) {
-      return `${(bytes / 1024).toFixed(1)} KB`;
+      return (bytes / 1024).toFixed(1) + ' KB';
     }
 
     if (bytes < 1024 * 1024 * 1024) {
-      return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+      return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
     }
 
-    return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+    return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
   }
-
-
-  function sendVoiceflowEvent(type, payload) {
-    if (
-      !window.voiceflow ||
-      !window.voiceflow.chat ||
-      typeof window.voiceflow.chat.interact !== 'function'
-    ) {
-      console.error('ARCOS: Voiceflow chat API is unavailable.');
-      return;
-    }
-
-    window.voiceflow.chat.interact({
-      type: type,
-      payload: payload || {}
-    });
-  }
-
 
   function setStatus(element, message) {
     if (element) {
@@ -117,11 +116,19 @@
     }
   }
 
+  function clearErrors(container) {
+    var errors = container.querySelectorAll('.arcos-error');
+
+    for (var i = 0; i < errors.length; i += 1) {
+      errors[i].remove();
+    }
+  }
 
   function buildError(message) {
-    const error = document.createElement('div');
+    var error = document.createElement('div');
 
-    error.style.marginTop = '10px';
+    error.className = 'arcos-error';
+    error.style.marginTop = '8px';
     error.style.padding = '10px';
     error.style.borderRadius = '8px';
     error.style.fontSize = '13px';
@@ -129,183 +136,387 @@
     error.style.background = '#fff1f1';
     error.style.border = '1px solid #f0b8b8';
     error.style.color = '#7a1f1f';
-
     error.textContent = message;
 
     return error;
   }
 
+  function sendVoiceflowEvent(payload) {
+    if (
+      !window.voiceflow ||
+      !window.voiceflow.chat ||
+      typeof window.voiceflow.chat.interact !== 'function'
+    ) {
+      console.error('ARCOS: Voiceflow chat API is unavailable.');
+      return false;
+    }
+
+    // Voiceflow's chat widget custom action pattern uses `complete`
+    // to return the custom action result to the conversation.
+    window.voiceflow.chat.interact({
+      type: 'complete',
+      payload: payload || {}
+    });
+
+    return true;
+  }
+
+  function setControlsDisabled(buttons, disabled) {
+    for (var i = 0; i < buttons.length; i += 1) {
+      if (!buttons[i]) {
+        continue;
+      }
+
+      buttons[i].disabled = disabled;
+
+      buttons[i].style.opacity = disabled
+        ? '0.55'
+        : (
+            buttons[i].classList.contains('arcos-cancel-button')
+              ? '0.75'
+              : '1'
+          );
+    }
+  }
+
+  function readVideoDuration(file) {
+    return new Promise(function (resolve) {
+      var objectUrl = URL.createObjectURL(file);
+      var video = document.createElement('video');
+      var settled = false;
+
+      function finish(value) {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+
+        try {
+          URL.revokeObjectURL(objectUrl);
+        } catch (error) {
+          // Ignore cleanup errors.
+        }
+
+        video.removeAttribute('src');
+        video.load();
+        resolve(value);
+      }
+
+      video.preload = 'metadata';
+
+      video.onloadedmetadata = function () {
+        var duration = video.duration;
+
+        if (!Number.isFinite(duration)) {
+          finish(null);
+          return;
+        }
+
+        finish(duration);
+      };
+
+      video.onerror = function () {
+        finish(null);
+      };
+
+      // Prevent a malformed video from leaving the selector
+      // waiting indefinitely.
+      setTimeout(function () {
+        finish(null);
+      }, 10000);
+
+      video.src = objectUrl;
+    });
+  }
+
+  // ------------------------------------------------------------
+  // Client-side validation
+  // ------------------------------------------------------------
+
+  async function validateSelectedFile(file, isEvidence) {
+    if (!file) {
+      return {
+        valid: false,
+        message: 'No file was selected.'
+      };
+    }
+
+    if (!Number.isFinite(file.size) || file.size <= 0) {
+      return {
+        valid: false,
+        message: 'That file appears to be empty. Please choose another file.'
+      };
+    }
+
+    var normalizedType = normalizeFileType(file.name);
+
+    if (!normalizedType) {
+      return {
+        valid: false,
+        message: 'That file type is not supported.'
+      };
+    }
+
+    // ----------------------------------------------------------
+    // Medical Documentation
+    // ----------------------------------------------------------
+
+    if (!isEvidence) {
+      if (!DOCUMENT_TYPES.includes(normalizedType)) {
+        return {
+          valid: false,
+          message: 'Please choose a JPG, JPEG, HEIC, or PDF file.'
+        };
+      }
+
+      if (file.size > MAX_DOCUMENT_BYTES) {
+        return {
+          valid: false,
+          message: 'That file is larger than the 50 MB limit.'
+        };
+      }
+
+      return {
+        valid: true,
+        normalizedType: normalizedType
+      };
+    }
+
+    // ----------------------------------------------------------
+    // Evidence: photo/document
+    // ----------------------------------------------------------
+
+    if (DOCUMENT_TYPES.includes(normalizedType)) {
+      if (file.size > MAX_DOCUMENT_BYTES) {
+        return {
+          valid: false,
+          message: 'That file is larger than the 50 MB limit.'
+        };
+      }
+
+      return {
+        valid: true,
+        normalizedType: normalizedType
+      };
+    }
+
+    // ----------------------------------------------------------
+    // Evidence: video
+    // ----------------------------------------------------------
+
+    if (VIDEO_TYPES.includes(normalizedType)) {
+      if (file.size > MAX_VIDEO_BYTES) {
+        return {
+          valid: false,
+          message: 'That video is larger than the 512 MB limit.'
+        };
+      }
+
+      var duration = await readVideoDuration(file);
+
+      if (duration === null) {
+        return {
+          valid: false,
+          message:
+            'That video could not be read. Please choose another MP4 or MOV file.'
+        };
+      }
+
+      if (duration > MAX_VIDEO_SECONDS) {
+        return {
+          valid: false,
+          message:
+            'That video is longer than the 180-second limit.'
+        };
+      }
+
+      return {
+        valid: true,
+        normalizedType: normalizedType,
+        duration: duration
+      };
+    }
+
+    return {
+      valid: false,
+      message: 'That file type is not supported.'
+    };
+  }
 
   // ============================================================
   // ARCOS FILE SELECTION EXTENSION
   // ============================================================
 
   window.ARCOSFileSelectionExtension = {
-
     name: 'ARCOSFileSelection',
-
     type: 'response',
 
-    match: function ({ trace }) {
+    match: function (args) {
+      var trace = args && args.trace ? args.trace : {};
+      var payload = trace.payload || {};
+
       return (
         trace.type === 'ext_arcos_file_selection' ||
-        trace.payload?.name === 'ext_arcos_file_selection'
+        payload.name === 'ext_arcos_file_selection'
       );
     },
 
-    render: function ({ trace, element }) {
+    render: function (args) {
+      var trace = args && args.trace ? args.trace : {};
+      var element = args && args.element ? args.element : null;
+      var payload = trace.payload || {};
 
-      const payload = trace.payload || {};
+      if (!element) {
+        return;
+      }
 
-      const fileCategory = String(
+      var fileCategory = String(
         payload.file_category ||
         payload.fileCategory ||
         ''
       ).trim().toLowerCase();
 
-      const isEvidence = fileCategory === 'evidence';
+      var isEvidence = fileCategory === 'evidence';
 
-      const container = document.createElement('div');
+      var container = document.createElement('div');
 
       container.style.width = '100%';
       container.style.boxSizing = 'border-box';
 
-
       // ----------------------------------------------------------
-      // HTML
+      // UI
       // ----------------------------------------------------------
 
-      container.innerHTML = `
-        <div
-          class="arcos-upload-card"
-          style="
-            display:flex;
-            flex-direction:column;
-            gap:10px;
-            padding:14px;
-            border:1px solid rgba(0,0,0,0.12);
-            border-radius:10px;
-            background:#ffffff;
-            box-sizing:border-box;
-          "
-        >
+      container.innerHTML =
+        '<div ' +
+          'class="arcos-upload-card" ' +
+          'style="' +
+            'display:flex;' +
+            'flex-direction:column;' +
+            'gap:10px;' +
+            'padding:14px;' +
+            'border:1px solid rgba(0,0,0,0.12);' +
+            'border-radius:10px;' +
+            'background:#ffffff;' +
+            'box-sizing:border-box;' +
+          '"' +
+        '>' +
 
-          <div
-            style="
-              font-size:14px;
-              font-weight:600;
-            "
-          >
-            ${
+          '<div style="font-size:14px;font-weight:600;">' +
+            (
               isEvidence
                 ? 'How would you like to upload your evidence?'
                 : 'Choose your medical document'
-            }
-          </div>
+            ) +
+          '</div>' +
 
+          '<button ' +
+            'type="button" ' +
+            'class="arcos-photo-document-button" ' +
+            'style="' +
+              'width:100%;' +
+              'padding:11px 14px;' +
+              'border:1px solid rgba(0,0,0,0.15);' +
+              'border-radius:8px;' +
+              'background:#ffffff;' +
+              'cursor:pointer;' +
+              'font-size:14px;' +
+            '"' +
+          '>' +
+            'Choose a photo or document' +
+          '</button>' +
 
-          <button
-            type="button"
-            class="arcos-photo-document-button"
-            style="
-              width:100%;
-              padding:11px 14px;
-              border:1px solid rgba(0,0,0,0.15);
-              border-radius:8px;
-              background:#ffffff;
-              cursor:pointer;
-              font-size:14px;
-            "
-          >
-            ${isEvidence ? 'Choose a photo or document' : 'Choose a photo or document'}
-          </button>
-
-
-          ${
+          (
             isEvidence
-              ? `
-                <button
-                  type="button"
-                  class="arcos-video-button"
-                  style="
-                    width:100%;
-                    padding:11px 14px;
-                    border:1px solid rgba(0,0,0,0.15);
-                    border-radius:8px;
-                    background:#ffffff;
-                    cursor:pointer;
-                    font-size:14px;
-                  "
-                >
-                  Choose a video
-                </button>
-              `
+              ? (
+                  '<button ' +
+                    'type="button" ' +
+                    'class="arcos-video-button" ' +
+                    'style="' +
+                      'width:100%;' +
+                      'padding:11px 14px;' +
+                      'border:1px solid rgba(0,0,0,0.15);' +
+                      'border-radius:8px;' +
+                      'background:#ffffff;' +
+                      'cursor:pointer;' +
+                      'font-size:14px;' +
+                    '"' +
+                  '>' +
+                    'Choose a video' +
+                  '</button>'
+                )
               : ''
-          }
+          ) +
 
+          '<button ' +
+            'type="button" ' +
+            'class="arcos-cancel-button" ' +
+            'style="' +
+              'width:100%;' +
+              'padding:8px 12px;' +
+              'border:none;' +
+              'background:transparent;' +
+              'cursor:pointer;' +
+              'font-size:13px;' +
+              'opacity:0.75;' +
+            '"' +
+          '>' +
+            'Cancel' +
+          '</button>' +
 
-          <button
-            type="button"
-            class="arcos-cancel-button"
-            style="
-              width:100%;
-              padding:8px 12px;
-              border:none;
-              background:transparent;
-              cursor:pointer;
-              font-size:13px;
-              opacity:0.75;
-            "
-          >
-            Cancel
-          </button>
+          '<div ' +
+            'class="arcos-status" ' +
+            'style="' +
+              'font-size:12px;' +
+              'line-height:1.4;' +
+              'opacity:0.75;' +
+            '"' +
+          '></div>' +
 
-
-          <div
-            class="arcos-status"
-            style="
-              font-size:12px;
-              line-height:1.4;
-              opacity:0.75;
-            "
-          ></div>
-
-        </div>
-      `;
-
+        '</div>';
 
       // ----------------------------------------------------------
       // Elements
       // ----------------------------------------------------------
 
-      const photoDocumentButton =
-        container.querySelector('.arcos-photo-document-button');
+      var photoDocumentButton =
+        container.querySelector(
+          '.arcos-photo-document-button'
+        );
 
-      const videoButton =
-        container.querySelector('.arcos-video-button');
+      var videoButton =
+        container.querySelector(
+          '.arcos-video-button'
+        );
 
-      const cancelButton =
-        container.querySelector('.arcos-cancel-button');
+      var cancelButton =
+        container.querySelector(
+          '.arcos-cancel-button'
+        );
 
-      const statusElement =
-        container.querySelector('.arcos-status');
-
+      var statusElement =
+        container.querySelector(
+          '.arcos-status'
+        );
 
       // ----------------------------------------------------------
       // Hidden file inputs
       // ----------------------------------------------------------
 
-      const photoDocumentInput = document.createElement('input');
+      var photoDocumentInput =
+        document.createElement('input');
 
       photoDocumentInput.type = 'file';
 
       photoDocumentInput.accept =
-        '.jpg,.jpeg,.heic,.pdf,image/jpeg,image/heic,application/pdf';
+        '.jpg,.jpeg,.heic,.pdf,' +
+        'image/jpeg,image/heic,application/pdf';
 
       photoDocumentInput.style.display = 'none';
 
-
-      const videoInput = document.createElement('input');
+      var videoInput =
+        document.createElement('input');
 
       videoInput.type = 'file';
 
@@ -314,260 +525,83 @@
 
       videoInput.style.display = 'none';
 
-
-      container.appendChild(photoDocumentInput);
+      container.appendChild(
+        photoDocumentInput
+      );
 
       if (isEvidence && videoButton) {
-        container.appendChild(videoInput);
+        container.appendChild(
+          videoInput
+        );
       }
 
-
       // ----------------------------------------------------------
-      // Disable selector UI
+      // Controls
       // ----------------------------------------------------------
 
       function disableControls() {
-
-        photoDocumentButton.disabled = true;
-
-        if (videoButton) {
-          videoButton.disabled = true;
-        }
-
-        cancelButton.disabled = true;
-
-        photoDocumentButton.style.opacity = '0.55';
-
-        if (videoButton) {
-          videoButton.style.opacity = '0.55';
-        }
-
-        cancelButton.style.opacity = '0.55';
+        setControlsDisabled(
+          [
+            photoDocumentButton,
+            videoButton,
+            cancelButton
+          ],
+          true
+        );
       }
-
-
-      // ----------------------------------------------------------
-      // Re-enable selector UI after validation failure
-      // ----------------------------------------------------------
 
       function enableControls() {
-
-        photoDocumentButton.disabled = false;
-
-        if (videoButton) {
-          videoButton.disabled = false;
-        }
-
-        cancelButton.disabled = false;
-
-        photoDocumentButton.style.opacity = '1';
-
-        if (videoButton) {
-          videoButton.style.opacity = '1';
-        }
-
-        cancelButton.style.opacity = '0.75';
+        setControlsDisabled(
+          [
+            photoDocumentButton,
+            videoButton,
+            cancelButton
+          ],
+          false
+        );
       }
-
-
-      // ----------------------------------------------------------
-      // Client-side validation
-      //
-      // This is UX validation only.
-      // The backend remains authoritative.
-      // ----------------------------------------------------------
-
-      async function validateSelectedFile(file) {
-
-        if (!file) {
-          return {
-            valid: false,
-            message: 'No file was selected.'
-          };
-        }
-
-
-        const normalizedType =
-          normalizeFileType(file.name);
-
-
-        if (!normalizedType) {
-          return {
-            valid: false,
-            message: 'That file type is not supported.'
-          };
-        }
-
-
-        const documentTypes = [
-          'JPG',
-          'JPEG',
-          'HEIC',
-          'PDF'
-        ];
-
-
-        const videoTypes = [
-          'MP4',
-          'MOV'
-        ];
-
-
-        // --------------------------------------------------------
-        // Medical Documentation
-        // --------------------------------------------------------
-
-        if (!isEvidence) {
-
-          if (!documentTypes.includes(normalizedType)) {
-            return {
-              valid: false,
-              message:
-                'Please choose a JPG, JPEG, HEIC, or PDF file.'
-            };
-          }
-
-
-          if (file.size > 50 * 1024 * 1024) {
-            return {
-              valid: false,
-              message:
-                'That file is larger than the 50 MB limit.'
-            };
-          }
-
-
-          return {
-            valid: true,
-            normalizedType: normalizedType
-          };
-        }
-
-
-        // --------------------------------------------------------
-        // Evidence: photo/document
-        // --------------------------------------------------------
-
-        if (documentTypes.includes(normalizedType)) {
-
-          if (file.size > 50 * 1024 * 1024) {
-            return {
-              valid: false,
-              message:
-                'That file is larger than the 50 MB limit.'
-            };
-          }
-
-
-          return {
-            valid: true,
-            normalizedType: normalizedType
-          };
-        }
-
-
-        // --------------------------------------------------------
-        // Evidence: video
-        // --------------------------------------------------------
-
-        if (videoTypes.includes(normalizedType)) {
-
-          if (file.size > 512 * 1024 * 1024) {
-            return {
-              valid: false,
-              message:
-                'That video is larger than the 512 MB limit.'
-            };
-          }
-
-
-          const duration = await new Promise(function (resolve) {
-
-            const video = document.createElement('video');
-
-            video.preload = 'metadata';
-
-            video.onloadedmetadata = function () {
-              const durationValue = video.duration;
-
-              URL.revokeObjectURL(video.src);
-
-              resolve(durationValue);
-            };
-
-
-            video.onerror = function () {
-              URL.revokeObjectURL(video.src);
-
-              resolve(null);
-            };
-
-
-            video.src = URL.createObjectURL(file);
-          });
-
-
-          if (duration === null || !Number.isFinite(duration)) {
-            return {
-              valid: false,
-              message:
-                'That video could not be read. Please choose another MP4 or MOV file.'
-            };
-          }
-
-
-          if (duration > 180) {
-            return {
-              valid: false,
-              message:
-                'That video is longer than the 180-second limit.'
-            };
-          }
-
-
-          return {
-            valid: true,
-            normalizedType: normalizedType,
-            duration: duration
-          };
-        }
-
-
-        return {
-          valid: false,
-          message: 'That file type is not supported.'
-        };
-      }
-
 
       // ----------------------------------------------------------
       // File selection
       // ----------------------------------------------------------
 
       async function handleFileSelection(file) {
-
         if (!file) {
           return;
         }
 
+        clearErrors(container);
+
+        disableControls();
 
         setStatus(
           statusElement,
           'Checking the selected file...'
         );
 
-
-        const validation =
-          await validateSelectedFile(file);
-
+        var validation =
+          await validateSelectedFile(
+            file,
+            isEvidence
+          );
 
         if (!validation.valid) {
+          state.selectedFile = null;
 
-          window.__ARCOS_SELECTED_FILE = null;
+          clearErrors(container);
 
-          container.appendChild(
-            buildError(validation.message)
-          );
+          var uploadCard =
+            container.querySelector(
+              '.arcos-upload-card'
+            );
+
+          if (uploadCard) {
+            uploadCard.appendChild(
+              buildError(
+                validation.message
+              )
+            );
+          }
 
           enableControls();
 
@@ -579,62 +613,55 @@
           return;
         }
 
+        // Store the actual browser File object locally.
+        //
+        // It is NOT serialized into Voiceflow variables and
+        // is NOT sent to the ARCOS backend API.
+        state.selectedFile = file;
 
-        // Store the actual browser File object.
-        window.__ARCOS_SELECTED_FILE = file;
+        state.selectionToken += 1;
 
-
-        const normalizedType =
-          validation.normalizedType;
-
-
-        disableControls();
-
+        var selectionToken =
+          state.selectionToken;
 
         setStatus(
           statusElement,
-          `${file.name} selected (${formatFileSize(file.size)}).`
+          file.name +
+            ' selected (' +
+            formatFileSize(file.size) +
+            ').'
         );
 
-
-        // --------------------------------------------------------
-        // Send metadata back to Voiceflow.
+        // Return metadata to Voiceflow.
         //
-        // The ARCOS Capture File Metadata Function reads these
-        // values from last_event.payload.
-        // --------------------------------------------------------
-
-        sendVoiceflowEvent(
-          'file_selected',
-          {
-            file_name: file.name,
-            file_type: normalizedType,
-            file_size: file.size
-          }
-        );
+        // The ARCOS Capture File Metadata Function can read
+        // these values from last_event.payload.
+        sendVoiceflowEvent({
+          arcos_event: 'file_selected',
+          file_category: fileCategory,
+          file_name: file.name,
+          file_type: validation.normalizedType,
+          file_size: file.size,
+          selection_token: selectionToken
+        });
       }
 
-
       // ----------------------------------------------------------
-      // Button handlers
+      // File chooser: photo/document
       // ----------------------------------------------------------
 
       photoDocumentButton.addEventListener(
         'click',
         function () {
-
           photoDocumentInput.value = '';
-
           photoDocumentInput.click();
         }
       );
 
-
       photoDocumentInput.addEventListener(
         'change',
         function () {
-
-          const file =
+          var file =
             photoDocumentInput.files &&
             photoDocumentInput.files[0];
 
@@ -642,28 +669,23 @@
         }
       );
 
+      // ----------------------------------------------------------
+      // File chooser: video
+      // ----------------------------------------------------------
 
       if (videoButton) {
-
         videoButton.addEventListener(
           'click',
           function () {
-
             videoInput.value = '';
-
             videoInput.click();
           }
         );
-      }
-
-
-      if (videoButton) {
 
         videoInput.addEventListener(
           'change',
           function () {
-
-            const file =
+            var file =
               videoInput.files &&
               videoInput.files[0];
 
@@ -672,7 +694,6 @@
         );
       }
 
-
       // ----------------------------------------------------------
       // Cancel
       // ----------------------------------------------------------
@@ -680,223 +701,297 @@
       cancelButton.addEventListener(
         'click',
         function () {
+          state.selectedFile = null;
 
-          window.__ARCOS_SELECTED_FILE = null;
+          state.selectionToken += 1;
 
-          disableControls();
+          photoDocumentInput.value = '';
+
+          if (videoInput) {
+            videoInput.value = '';
+          }
 
           setStatus(
             statusElement,
             'Upload cancelled.'
           );
 
+          disableControls();
 
-          sendVoiceflowEvent(
-            'cancelled',
-            {}
-          );
+          sendVoiceflowEvent({
+            arcos_event: 'cancelled',
+            file_category: fileCategory
+          });
         }
       );
-
 
       element.appendChild(container);
     }
   };
-
 
   // ============================================================
   // ARCOS FILE UPLOAD EXTENSION
   // ============================================================
 
   window.ARCOSFileUploadExtension = {
-
     name: 'ARCOSFileUpload',
-
     type: 'response',
 
-    match: function ({ trace }) {
+    match: function (args) {
+      var trace = args && args.trace ? args.trace : {};
+      var payload = trace.payload || {};
+
       return (
         trace.type === 'ext_arcos_file_upload' ||
-        trace.payload?.name === 'ext_arcos_file_upload'
+        payload.name === 'ext_arcos_file_upload'
       );
     },
 
-    render: function ({ trace, element }) {
+    render: function (args) {
+      var trace = args && args.trace ? args.trace : {};
+      var element = args && args.element ? args.element : null;
+      var payload = trace.payload || {};
 
-      const payload = trace.payload || {};
+      if (!element) {
+        return;
+      }
 
-      const uploadId =
+      var uploadId =
         String(
           payload.upload_id || ''
         ).trim();
 
-
-      const temporaryUploadUrl =
+      var temporaryUploadUrl =
         String(
           payload.temporary_upload_url || ''
         ).trim();
 
-
-      const expectedFileName =
-        String(
-          payload.file_name || ''
-        ).trim();
-
-
-      const expectedFileType =
+      var expectedFileType =
         String(
           payload.file_type || ''
-        ).trim()
-        .toUpperCase();
+        )
+          .trim()
+          .toUpperCase();
 
+      var expectedFileSize =
+        Number(
+          payload.file_size
+        );
 
-      const expectedFileSize =
-        Number(payload.file_size);
+      var container =
+        document.createElement('div');
 
+      container.style.padding =
+        '12px 0';
 
-      const container = document.createElement('div');
-
-      container.style.padding = '12px 0';
-
-
-      const status = document.createElement('div');
+      var status =
+        document.createElement('div');
 
       status.textContent =
         'Uploading your file securely...';
 
-      status.style.fontSize = '13px';
+      status.style.fontSize =
+        '13px';
 
-      status.style.lineHeight = '1.5';
-
+      status.style.lineHeight =
+        '1.5';
 
       container.appendChild(status);
 
       element.appendChild(container);
 
-
       // ----------------------------------------------------------
-      // Validate the browser-side state before uploading.
+      // Prevent duplicate upload attempts.
       // ----------------------------------------------------------
-
-      const file =
-        window.__ARCOS_SELECTED_FILE;
-
-
-      if (!file) {
-
-        status.textContent =
-          'We couldn’t access the selected file.';
-
-        sendVoiceflowEvent(
-          'upload_failed',
-          {
-            upload_id: uploadId
-          }
-        );
-
-        return;
-      }
-
-
-      if (!uploadId || !temporaryUploadUrl) {
-
-        status.textContent =
-          'The secure upload could not be started.';
-
-        sendVoiceflowEvent(
-          'upload_failed',
-          {
-            upload_id: uploadId
-          }
-        );
-
-        return;
-      }
-
-
-      const actualFileType =
-        normalizeFileType(file.name);
-
 
       if (
-        expectedFileName &&
-        file.name !== expectedFileName
+        uploadId &&
+        state.activeUploadId === uploadId
       ) {
-
-        console.error(
-          'ARCOS: File name mismatch.'
-        );
-
         status.textContent =
-          'The selected file no longer matches the upload request.';
+          'Your file upload is already in progress.';
+
+        return;
+      }
+
+      if (uploadId) {
+        state.activeUploadId =
+          uploadId;
+      }
+
+      var file =
+        state.selectedFile;
+
+      var selectionTokenAtUploadStart =
+        state.selectionToken;
+
+      // ----------------------------------------------------------
+      // Failure handler
+      // ----------------------------------------------------------
+
+      function failUpload(
+        message,
+        extraPayload
+      ) {
+        status.textContent =
+          message;
+
+        if (
+          uploadId &&
+          state.activeUploadId === uploadId
+        ) {
+          state.activeUploadId = null;
+        }
+
+        // Do not destroy a newer selection made by
+        // a later submission.
+        if (
+          state.selectionToken ===
+          selectionTokenAtUploadStart
+        ) {
+          state.selectedFile = null;
+        }
 
         sendVoiceflowEvent(
-          'upload_failed',
-          {
-            upload_id: uploadId
-          }
+          Object.assign(
+            {
+              arcos_event:
+                'upload_failed',
+
+              upload_id:
+                uploadId
+            },
+            extraPayload || {}
+          )
+        );
+      }
+
+      // ----------------------------------------------------------
+      // Validate browser state.
+      // ----------------------------------------------------------
+
+      if (!file) {
+        failUpload(
+          'We couldn’t access the selected file.'
         );
 
         return;
       }
 
+      if (
+        !uploadId ||
+        !temporaryUploadUrl
+      ) {
+        failUpload(
+          'The secure upload could not be started.'
+        );
+
+        return;
+      }
+
+      // ----------------------------------------------------------
+      // Determine actual browser file type.
+      // ----------------------------------------------------------
+
+      var actualFileType =
+        normalizeFileType(
+          file.name
+        );
+
+      if (!actualFileType) {
+        failUpload(
+          'The selected file type is not supported.'
+        );
+
+        return;
+      }
+
+      // ----------------------------------------------------------
+      // Validate type against backend authorization.
+      // ----------------------------------------------------------
 
       if (
         expectedFileType &&
         actualFileType !== expectedFileType
       ) {
-
         console.error(
-          'ARCOS: File type mismatch.'
+          'ARCOS: File type mismatch.',
+          {
+            expected:
+              expectedFileType,
+
+            actual:
+              actualFileType
+          }
         );
 
-        status.textContent =
-          'The selected file no longer matches the upload request.';
-
-        sendVoiceflowEvent(
-          'upload_failed',
-          {
-            upload_id: uploadId
-          }
+        failUpload(
+          'The selected file no longer matches the upload request.'
         );
 
         return;
       }
 
+      // ----------------------------------------------------------
+      // Optional size consistency check.
+      // ----------------------------------------------------------
+      //
+      // /secure-upload does NOT accept client-supplied size,
+      // so file_size may not be present in the API result.
+      // When Voiceflow does provide it, validate it.
+      // ----------------------------------------------------------
 
       if (
-        Number.isFinite(expectedFileSize) &&
+        Number.isFinite(
+          expectedFileSize
+        ) &&
+        expectedFileSize > 0 &&
         file.size !== expectedFileSize
       ) {
-
         console.error(
-          'ARCOS: File size mismatch.'
+          'ARCOS: File size mismatch.',
+          {
+            expected:
+              expectedFileSize,
+
+            actual:
+              file.size
+          }
         );
 
-        status.textContent =
-          'The selected file no longer matches the upload request.';
-
-        sendVoiceflowEvent(
-          'upload_failed',
-          {
-            upload_id: uploadId
-          }
+        failUpload(
+          'The selected file no longer matches the upload request.'
         );
 
         return;
       }
 
+      // ----------------------------------------------------------
+      // IMPORTANT:
+      //
+      // Do NOT compare file.name to the backend response
+      // file_name.
+      //
+      // /secure-upload sanitizes the filename before returning
+      // it. A literal browser-name comparison could therefore
+      // reject an otherwise valid upload.
+      // ----------------------------------------------------------
 
       // ----------------------------------------------------------
-      // Perform direct PUT to the temporary GCS signed URL.
+      // Canonical content type.
+      //
+      // We derive it from the authorized extension rather than
+      // trusting browser File.type.
       // ----------------------------------------------------------
 
-      const contentType =
-        getContentType(
-          file,
+      var contentType =
+        getCanonicalContentType(
           actualFileType
         );
 
+      // ----------------------------------------------------------
+      // Direct browser -> signed GCS PUT
+      // ----------------------------------------------------------
 
       fetch(
         temporaryUploadUrl,
@@ -904,66 +999,78 @@
           method: 'PUT',
 
           headers: {
-            'Content-Type': contentType
+            'Content-Type':
+              contentType
           },
 
-          body: file
+          body:
+            file
         }
       )
-        .then(function (response) {
+        .then(
+          function (response) {
+            if (!response.ok) {
+              throw new Error(
+                'GCS upload failed with HTTP ' +
+                  response.status +
+                  '.'
+              );
+            }
 
-          if (!response.ok) {
+            return response;
+          }
+        )
 
-            throw new Error(
-              `GCS upload failed with HTTP ${response.status}.`
+        .then(
+          function () {
+            status.textContent =
+              'File uploaded securely.';
+
+            if (
+              state.selectionToken ===
+              selectionTokenAtUploadStart
+            ) {
+              state.selectedFile = null;
+            }
+
+            if (
+              state.activeUploadId ===
+              uploadId
+            ) {
+              state.activeUploadId = null;
+            }
+
+            sendVoiceflowEvent({
+              arcos_event:
+                'upload_complete',
+
+              upload_id:
+                uploadId
+            });
+          }
+        )
+
+        .catch(
+          function (error) {
+            console.error(
+              'ARCOS upload failed:',
+              error
+            );
+
+            failUpload(
+              'The file could not be uploaded.'
             );
           }
-
-          return response;
-        })
-
-        .then(function () {
-
-          status.textContent =
-            'File uploaded securely.';
-
-          // Clear the local browser File reference.
-          window.__ARCOS_SELECTED_FILE = null;
-
-
-          // Tell the Voiceflow Execute File Upload
-          // Function that the PUT succeeded.
-          sendVoiceflowEvent(
-            'upload_complete',
-            {
-              upload_id: uploadId
-            }
-          );
-        })
-
-        .catch(function (error) {
-
-          console.error(
-            'ARCOS upload failed:',
-            error
-          );
-
-
-          window.__ARCOS_SELECTED_FILE = null;
-
-
-          status.textContent =
-            'The file could not be uploaded.';
-
-
-          sendVoiceflowEvent(
-            'upload_failed',
-            {
-              upload_id: uploadId
-            }
-          );
-        });
+        );
     }
   };
 
+  // ------------------------------------------------------------
+  // Load confirmation
+  // ------------------------------------------------------------
+
+  console.info(
+    'ARCOS File Upload Extensions loaded. Version ' +
+      ARCOS_EXTENSION_VERSION
+  );
 })();
