@@ -357,8 +357,8 @@
       var payload = trace.payload || {};
 
       return (
-        trace.type === 'ext_arcos_file_selection' ||
-        payload.name === 'ext_arcos_file_selection'
+        trace.type === 'ARCOS_File_Selection' ||
+        payload.name === 'ARCOS_File_Selection'
       );
     },
 
