@@ -141,6 +141,31 @@
     return error;
   }
 
+  // ------------------------------------------------------------
+  // Voiceflow event bridge
+  // ------------------------------------------------------------
+  //
+  // ARCOS Function Tools listen for specific event types such as:
+  //
+  //   file_selected
+  //   file_cancelled
+  //   upload_complete
+  //   upload_failed
+  //
+  // The event name is stored in `arcos_event` and is also sent
+  // as the actual Voiceflow interaction `type`.
+  //
+  // This is necessary so the Function Tool listener can match:
+  //
+  //   event.type === 'file_selected'
+  //
+  // instead of receiving:
+  //
+  //   event.type === 'complete'
+  //
+  // with `file_selected` buried inside the payload.
+  // ------------------------------------------------------------
+
   function sendVoiceflowEvent(payload) {
     if (
       !window.voiceflow ||
@@ -151,11 +176,12 @@
       return false;
     }
 
-    // Voiceflow's chat widget custom action pattern uses `complete`
-    // to return the custom action result to the conversation.
+    var eventPayload = payload || {};
+    var eventType = eventPayload.arcos_event || 'complete';
+
     window.voiceflow.chat.interact({
-      type: 'complete',
-      payload: payload || {}
+      type: eventType,
+      payload: eventPayload
     });
 
     return true;
@@ -634,8 +660,8 @@
 
         // Return metadata to Voiceflow.
         //
-        // The ARCOS Capture File Metadata Function can read
-        // these values from last_event.payload.
+        // `sendVoiceflowEvent()` sends `file_selected` as the
+        // actual Voiceflow interaction type.
         sendVoiceflowEvent({
           arcos_event: 'file_selected',
           file_category: fileCategory,
@@ -718,6 +744,11 @@
 
           disableControls();
 
+          // NOTE:
+          // This intentionally remains `cancelled` for now.
+          // The Voiceflow Function Tool currently listens for
+          // `file_cancelled`. We will fix that separately after
+          // the successful file-selection path is confirmed.
           sendVoiceflowEvent({
             arcos_event: 'cancelled',
             file_category: fileCategory
